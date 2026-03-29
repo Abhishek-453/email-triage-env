@@ -117,7 +117,7 @@ def health():
     return {"status": "ok", "env": "email-triage-env"}
 
 
-@app.get("/reset", response_model=ResetResponse)
+@app.post("/reset", response_model=ResetResponse)
 def reset():
     global _state
     _state = _fresh_state()
