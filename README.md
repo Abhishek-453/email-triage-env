@@ -3,7 +3,14 @@
 An **OpenEnv-compliant** environment for the Scaler x Meta PyTorch OpenEnv Hackathon.
 
 An AI agent must triage a simulated email inbox by classifying priority, detecting spam, and drafting replies.
-
+---
+title: Email Triage Env
+emoji: 📧
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+---
 ---
 
 ## Tasks
