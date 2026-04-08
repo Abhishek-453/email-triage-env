@@ -1,6 +1,5 @@
 """
-inference.py — Root-level inference script
-Uses OpenAI-compatible client as required by submission rules.
+inference.py — Root-level inference script with Structured Logging
 """
 
 import os
@@ -10,31 +9,25 @@ import subprocess
 import requests
 from openai import OpenAI
 
-# ── Updated Ports to match Dockerfile (7860) ──
+# ── Configuration ──
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api-inference.huggingface.co/v1")
 MODEL_NAME   = os.environ.get("MODEL_NAME",   "meta-llama/Llama-3.1-8B-Instruct")
 HF_TOKEN     = os.environ.get("HF_TOKEN",     "")
 ENV_URL      = os.environ.get("ENV_URL",      "http://localhost:7860")
 
-# OpenAI Client setup with robust error handling to prevent Phase 2 crashes
+# OpenAI Client Setup
 client = None
 try:
-    # Ensure base_url is clean and has /v1 suffix if missing for HF
     clean_url = API_BASE_URL.strip() if API_BASE_URL else "https://api-inference.huggingface.co/v1"
     if "huggingface.co" in clean_url and not clean_url.endswith("/v1"):
         clean_url = clean_url.rstrip("/") + "/v1"
     
-    client = OpenAI(
-        api_key=HF_TOKEN if HF_TOKEN else "dummy_token",
-        base_url=clean_url
-    )
-    print(f"[DEBUG] Client initialized for URL: {clean_url}")
+    client = OpenAI(api_key=HF_TOKEN if HF_TOKEN else "dummy", base_url=clean_url)
 except Exception as e:
-    print(f"[FATAL] Client failed to initialize: {e}")
+    print(f"Init Error: {e}", flush=True)
 
 def llm(prompt: str, max_tokens: int = 150) -> str:
-    if client is None:
-        return ""
+    if not client: return ""
     try:
         completion = client.chat.completions.create(
             model=MODEL_NAME,
@@ -42,118 +35,69 @@ def llm(prompt: str, max_tokens: int = 150) -> str:
             max_tokens=max_tokens,
         )
         return completion.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"[llm ERROR] {e}")
+    except Exception:
         return ""
 
-def wait_for_server(url: str, retries: int = 25, delay: float = 2.0):
-    for i in range(retries):
+def wait_for_server(url: str):
+    for _ in range(30):
         try:
-            r = requests.get(url, timeout=5)
-            if r.status_code == 200:
-                print(f"[inference] Server is up at {url}")
-                return
-        except Exception:
-            pass
-        time.sleep(delay)
-    raise RuntimeError(f"Server at {url} did not start in time.")
+            if requests.get(url, timeout=5).status_code == 200: return
+        except: pass
+        time.sleep(2)
 
-def start_server():
-    # Using Port 7860 to match Dockerfile EXPOSE and HEALTHCHECK 
-    return subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-
-def run_task(task_name: str, inbox: list) -> float:
+def run_task(task_name: str, inbox: list):
+    # --- [START] REQUIRED BLOCK ---
+    print(f"[START] task={task_name}", flush=True)
+    
     prompts = {
-        "classify": (
-            "Classify this email priority as HIGH, MEDIUM, or LOW.\n"
-            "Reply with ONE word only — exactly HIGH, MEDIUM, or LOW.\n\n"
-            "From: {from_}\nSubject: {subject}\nBody: {body}"
-        ),
-        "spam_check": (
-            "Is this email spam? Reply with ONLY the word true or false.\n\n"
-            "From: {from_}\nSubject: {subject}\nBody: {body}"
-        ),
-        "reply": (
-            "Draft a short professional reply (20-80 words) to this email.\n\n"
-            "From: {from_}\nSubject: {subject}\nBody: {body}\n\nReply:"
-        ),
+        "classify": "Classify priority: HIGH, MEDIUM, or LOW. Reply with ONE word only.\n\nEmail: {body}",
+        "spam_check": "Is this spam? Reply ONLY true or false.\n\nEmail: {body}",
+        "reply": "Draft a short professional reply.\n\nEmail: {body}"
     }
 
     total_reward = 0.0
-    for email in inbox:
+    for i, email in enumerate(inbox):
         try:
-            prompt = prompts[task_name].format(
-                from_=email["from"],
-                subject=email["subject"],
-                body=email["body"],
-            )
-            value = llm(prompt, max_tokens=150 if task_name == "reply" else 10)
-
+            prompt = prompts[task_name].format(body=email["body"])
+            value = llm(prompt, max_tokens=100 if task_name == "reply" else 5)
+            
             if task_name == "spam_check":
                 value = value.lower().startswith("true")
 
             resp = requests.post(
                 f"{ENV_URL}/step",
                 json={"action": task_name, "email_id": email["id"], "value": value},
-                timeout=30,
+                timeout=30
             )
-            resp.raise_for_status()
             reward = resp.json().get("reward", 0.0)
             total_reward += reward
-        except Exception as e:
-            print(f"  [{task_name}] email={email['id']} ERROR: {e}")
-            total_reward += 0.0
+            
+            # --- [STEP] REQUIRED BLOCK ---
+            print(f"[STEP] step={i+1} reward={reward:.2f}", flush=True)
 
-    return total_reward / len(inbox) if inbox else 0.0
+        except Exception:
+            print(f"[STEP] step={i+1} reward=0.0", flush=True)
+
+    score = total_reward / len(inbox) if inbox else 0.0
+    # --- [END] REQUIRED BLOCK ---
+    print(f"[END] task={task_name} score={score:.4f} steps={len(inbox)}", flush=True)
+    return score
 
 def main():
-    start_time = time.time()
-    print("=" * 60)
-    print("email-triage-env  |  Inference Script")
-    print("=" * 60)
-
-    server_proc = None
+    server_proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    
     try:
-        server_proc = start_server()
         wait_for_server(f"{ENV_URL}/")
-
-        scores = {}
         tasks = ["classify", "spam_check", "reply"]
-
         for task in tasks:
-            print(f"\n-- Task: {task} --")
-            try:
-                # /reset is a POST endpoint in app.py [cite: 1]
-                reset_resp = requests.post(f"{ENV_URL}/reset", timeout=30)
-                reset_resp.raise_for_status()
-                inbox = reset_resp.json()["inbox"]
-                print(f"   Inbox size: {len(inbox)} emails")
-                
-                score = run_task(task, inbox)
-                scores[task] = score
-                print(f"   Score: {score:.4f}")
-            except Exception as e:
-                print(f"   [ERROR] Task {task} failed: {e}")
-                scores[task] = 0.0
-
-        overall = sum(scores.values()) / len(scores) if scores else 0.0
-        print("\n" + "=" * 60)
-        print(f"RESULTS | Overall Score : {overall:.4f}")
-        print("=" * 60)
-
-        return scores
-
-    except Exception as e:
-        print(f"[FATAL ERROR] {e}")
-        return {}
-
+            reset_resp = requests.post(f"{ENV_URL}/reset", timeout=30)
+            inbox = reset_resp.json().get("inbox", [])
+            run_task(task, inbox)
     finally:
-        if server_proc:
-            server_proc.terminate()
+        server_proc.terminate()
 
 if __name__ == "__main__":
     main()
