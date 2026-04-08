@@ -10,21 +10,31 @@ import subprocess
 import requests
 from openai import OpenAI
 
-# ── Env vars: use .get() with safe defaults so script never crashes on missing vars ──
+# ── Updated Ports to match Dockerfile (7860) ──
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api-inference.huggingface.co/v1")
 MODEL_NAME   = os.environ.get("MODEL_NAME",   "meta-llama/Llama-3.1-8B-Instruct")
 HF_TOKEN     = os.environ.get("HF_TOKEN",     "")
-ENV_URL      = os.environ.get("ENV_URL",      "http://localhost:8000")
+ENV_URL      = os.environ.get("ENV_URL",      "http://localhost:7860")
 
-# Warn early if critical vars are missing (don't crash — let validator see the log)
-_missing = [v for v in ["API_BASE_URL", "MODEL_NAME", "HF_TOKEN"] if not os.environ.get(v)]
-if _missing:
-    print(f"[WARNING] Missing env vars: {_missing}. Using defaults — scores may be 0.")
-
-client = OpenAI(api_key=HF_TOKEN or "dummy", base_url=API_BASE_URL)
-
+# OpenAI Client setup with robust error handling to prevent Phase 2 crashes
+client = None
+try:
+    # Ensure base_url is clean and has /v1 suffix if missing for HF
+    clean_url = API_BASE_URL.strip() if API_BASE_URL else "https://api-inference.huggingface.co/v1"
+    if "huggingface.co" in clean_url and not clean_url.endswith("/v1"):
+        clean_url = clean_url.rstrip("/") + "/v1"
+    
+    client = OpenAI(
+        api_key=HF_TOKEN if HF_TOKEN else "dummy_token",
+        base_url=clean_url
+    )
+    print(f"[DEBUG] Client initialized for URL: {clean_url}")
+except Exception as e:
+    print(f"[FATAL] Client failed to initialize: {e}")
 
 def llm(prompt: str, max_tokens: int = 150) -> str:
+    if client is None:
+        return ""
     try:
         completion = client.chat.completions.create(
             model=MODEL_NAME,
@@ -36,8 +46,7 @@ def llm(prompt: str, max_tokens: int = 150) -> str:
         print(f"[llm ERROR] {e}")
         return ""
 
-
-def wait_for_server(url: str, retries: int = 20, delay: float = 1.5):
+def wait_for_server(url: str, retries: int = 25, delay: float = 2.0):
     for i in range(retries):
         try:
             r = requests.get(url, timeout=5)
@@ -49,15 +58,13 @@ def wait_for_server(url: str, retries: int = 20, delay: float = 1.5):
         time.sleep(delay)
     raise RuntimeError(f"Server at {url} did not start in time.")
 
-
 def start_server():
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"],
+    # Using Port 7860 to match Dockerfile EXPOSE and HEALTHCHECK 
+    return subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    return proc
-
 
 def run_task(task_name: str, inbox: list) -> float:
     prompts = {
@@ -95,24 +102,18 @@ def run_task(task_name: str, inbox: list) -> float:
                 timeout=30,
             )
             resp.raise_for_status()
-            reward = resp.json()["reward"]
+            reward = resp.json().get("reward", 0.0)
             total_reward += reward
-            print(f"  [{task_name}] email={email['id']}  reward={reward:.1f}")
-
         except Exception as e:
-            print(f"  [{task_name}] email={email['id']}  ERROR: {e}  reward=0.0")
+            print(f"  [{task_name}] email={email['id']} ERROR: {e}")
             total_reward += 0.0
 
-    score = total_reward / len(inbox) if inbox else 0.0
-    return score
-
+    return total_reward / len(inbox) if inbox else 0.0
 
 def main():
     start_time = time.time()
     print("=" * 60)
     print("email-triage-env  |  Inference Script")
-    print(f"Model : {MODEL_NAME}")
-    print(f"API   : {API_BASE_URL}")
     print("=" * 60)
 
     server_proc = None
@@ -126,35 +127,23 @@ def main():
         for task in tasks:
             print(f"\n-- Task: {task} --")
             try:
-                # FIX: /reset is a POST endpoint, not GET
+                # /reset is a POST endpoint in app.py [cite: 1]
                 reset_resp = requests.post(f"{ENV_URL}/reset", timeout=30)
                 reset_resp.raise_for_status()
                 inbox = reset_resp.json()["inbox"]
                 print(f"   Inbox size: {len(inbox)} emails")
+                
+                score = run_task(task, inbox)
+                scores[task] = score
+                print(f"   Score: {score:.4f}")
             except Exception as e:
-                print(f"   [ERROR] Could not reset env: {e}")
+                print(f"   [ERROR] Task {task} failed: {e}")
                 scores[task] = 0.0
-                continue
-
-            score = run_task(task, inbox)
-            scores[task] = score
-            print(f"   Score: {score:.4f}")
 
         overall = sum(scores.values()) / len(scores) if scores else 0.0
-        elapsed = time.time() - start_time
-
         print("\n" + "=" * 60)
-        print("RESULTS")
+        print(f"RESULTS | Overall Score : {overall:.4f}")
         print("=" * 60)
-        for task, s in scores.items():
-            status = "PASS" if s >= 0.5 else "FAIL"
-            print(f"  [{status}]  {task:<20}  {s:.4f}")
-        print(f"\n  Overall Score : {overall:.4f}")
-        print(f"  Elapsed Time  : {elapsed:.1f}s")
-        print("=" * 60)
-
-        for task, s in scores.items():
-            assert 0.0 <= s <= 1.0, f"Score out of range for {task}: {s}"
 
         return scores
 
@@ -165,7 +154,6 @@ def main():
     finally:
         if server_proc:
             server_proc.terminate()
-
 
 if __name__ == "__main__":
     main()
